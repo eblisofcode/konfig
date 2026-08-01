@@ -1,0 +1,87 @@
+name: Update Telegram subscriptions
+
+on:
+  schedule:
+    # Five runs per Tehran calendar day, away from minute 0 to reduce queue delays.
+    - cron: "17 0,5,10,15,20 * * *"
+      timezone: "Asia/Tehran"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: telegram-subscription-collector
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Collect and merge subscription sources
+        run: |
+          python scripts/collect_subscriptions.py \
+            --message-url "https://t.me/xsfilterrnet/3549" \
+            --fallback-file "config/fallback_urls.txt" \
+            --output-dir "subscriptions" \
+            --summary-file "$RUNNER_TEMP/collector-summary.md" \
+            --workers 8 \
+            --timeout 25 \
+            --retries 3 \
+            --max-source-mib 12 \
+            --max-total-mib 80
+
+      - name: Add collector summary
+        if: always()
+        run: |
+          if [[ -f "$RUNNER_TEMP/collector-summary.md" ]]; then
+            cat "$RUNNER_TEMP/collector-summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## Subscription collector" >> "$GITHUB_STEP_SUMMARY"
+            echo "Collector stopped before producing a summary." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Commit changed generated files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add subscriptions/
+
+          if git diff --cached --quiet; then
+            echo "No generated content changed."
+            exit 0
+          fi
+
+          git commit -m "chore: update subscription snapshot"
+
+          branch="${GITHUB_REF_NAME}"
+          for attempt in 1 2 3; do
+            git pull --rebase origin "$branch"
+            if git push origin "HEAD:$branch"; then
+              exit 0
+            fi
+            echo "Push attempt $attempt failed; retrying..." >&2
+            sleep $((attempt * 3))
+          done
+
+          echo "Could not push generated changes after 3 attempts." >&2
+          exit 1
